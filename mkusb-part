@@ -1,0 +1,436 @@
+#!/usr/bin/env bash
+
+# mkusb-part is a bash utility to create bootable USB sticks with persistence
+# and a Windows-compatible storage partition.
+#
+# Copyright (C) 2023 João Nuno Oliveira <joaonunoao@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+# Credits:
+# * C. S. Cameron for sending me down the right path with this great 'ask Ubuntu' answer:
+#   https://askubuntu.com/a/1284930
+# * mook765 for succintly explaining how GPT partition tables reserve sectors at both start and end of devices:
+#   https://askubuntu.com/a/1145468
+# * The Geek Diary for this handy tutorial on loopback devices:
+#   https://www.thegeekdiary.com/how-to-create-virtual-block-device-loop-device-filesystem-in-linux/
+
+# TODO:
+# * accept IEC units for -p argument
+#     > echo "$@" | sed 's/B$//' | numfmt --from iec-i
+# * increase partition sizes up (except storage partition, which would be decreased) to the next multiple of alignment
+#     > blockdev --getalignoff "$DISK"
+# * fail if any of the device's partitions are mounted
+# * add -f, --force option which unmounts any mounted device's partitions
+# * option to get partition definition from file / stdin?
+# * option for no storage partition, using all possible space for the persistence partition
+# * option to set the image size or ext4 overhead percentage?
+# * can the calls to mkfs be more generic to easily support most filesystem types, with the exception of ntfs?
+# * test mode which creates a loopback device of given size, prints the device path and exits (-t --test ?) (option to clean up?)
+# * add tab completion support?
+
+set -euo pipefail
+
+declare -r VERSION='0.1'
+
+# See /usr/include/sysexits.h
+declare -r EX_USAGE=64      # command line usage error
+declare -r EX_DATAERR=65    # data format error
+
+declare -r MiB=1048576
+declare -r GiB=1073741824
+
+declare -r TTY=$(tty)
+
+usage () {
+    echo \
+"
+Usage: $0 [OPTION]... IMAGE DEVICE
+
+Make DEVICE bootable using the operating system in IMAGE with casper persistence and windows compatible storage.
+
+Options:
+ -p, --persistence=SIZE     the size, in MiB, of the persistence partition (default 4GiB)
+ -v, --verbose              show details of operations as they are executed
+
+ -h, --help                 display this help
+     --version              display version
+"
+
+    exit "$1"
+}
+
+main () {
+    parse_args "$@"    
+
+    declare -r parts=$(define_partitions)
+    echo "$parts" | make_partitions
+
+    local -r boot_index=$(awk '/boot/{ print NR; exit }' <(echo "$parts"))
+    local -r root_index=$(awk '/root/{ print NR; exit }' <(echo "$parts"))
+
+    local -r boot_name="$(get_partition_name "$DISK" "$boot_index")"
+
+    copy_iso_contents "$boot_name" "$(get_partition_name "$DISK" "$root_index")"
+
+    local -r grub_index=$(awk '/bios_grub/{ print NR; exit }' <(echo "$parts"))
+    install_grub "$(get_partition_name "$DISK" "$grub_index")" "$boot_name" "$root_index"
+}
+
+parse_args () {
+    # Parse and validate command line arguments.
+    #  $@ - command line arguments
+    #
+    # Sets:
+    #  DISK
+    #  IMAGE
+    #  PERSISTENCE_SIZE
+    #  VERBOSE
+
+    local -r options="p:vh"
+    local -r long="persistence:,verbose,help,version"
+
+    local args
+
+    # Optional arguments. Note the sed command allowing support for '=' in long options by replacing them with ' '.
+    args=$(getopt --name "$0" --options="$options" --long="$long" -- $(sed -E 's/(--[a-z]+)=([^ ]+)/\1 \2/g' <(echo "$@")))
+    if [ $? -ne 0 ]; then
+        usage "$EX_USAGE"
+    fi
+
+    eval set -- "$args"
+
+    while true; do
+        case "$1" in
+            -h|--help)
+                usage 0;;
+            
+            -p|--persistent)
+                if ! [[ $1 =~ ^[0-9]+$ ]]; then
+                    error "optional argument $1 must be succeeded by an integer"
+                    usage "$EX_USAGE"
+                fi
+
+                local -r persistence_size=$2
+                shift 2;;
+
+            -v|--verbose)
+                declare -r verbose=true
+                shift;;
+            
+            --version)
+                echo "$0 v$VERSION"
+                exit 0;;
+
+            --)
+                shift
+                break;;
+        esac
+    done
+
+    declare -gr PERSISTENCE_SIZE="${persistence_size:=$((4 * GiB / MiB))}"
+    declare -gr VERBOSE="${verbose:=false}"
+
+    # Positional arguments.
+    if [ -z "$1" ] || ! [ -f "$1" ] || [[ "$1" != *.iso ]]; then
+        error "second position argument is missing or is not an iso file"
+        usage "$EX_USAGE"
+    fi
+
+    if [ -z "$2" ] || ! [ -b "$2" ]; then
+        error "first positional argument is missing or is not a block device"
+        usage "$EX_USAGE"
+    fi
+
+    declare -gr IMAGE=$1
+    declare -gr DISK=$2
+
+    info "running $0 with the following options:"
+    info " PERSISTENCE_SIZE=$PERSISTENCE_SIZE"
+    info " VERBOSE=$VERBOSE"
+    info " DISK=$DISK"
+    info " IMAGE=$IMAGE"
+    info ""
+}
+
+define_partitions () {
+    # Defines the partitions to be created in the device. Uses the following global variables:
+    #  $DISK             - the given block device
+    #  $IMAGE            - the given os image
+    #  $PERSISTENCE_SIZE - the size of the casper-rw persistence partition
+    #
+    # Returns information on the partitions, one per line, in the following format:
+    #  NAME FILESYSTEM_TYPE START_SECTOR END_SECTOR [FLAG]...
+
+    # Determine the number of bytes per sector, then how many sectors are in a MiB and a GiB.
+    # This allows using sizes in sectors, facilitating the use of gparted and good memory alignment.
+    local sector_bytes
+    sector_bytes=$(blockdev --getpbsz "$DISK")
+
+    local -r sMiB=$((MiB / sector_bytes))
+    local -r sGiB=$((GiB / sector_bytes))
+
+    info "$sector_bytes bytes per sector"
+
+    # Determine the size of the image, as that dictates the size of root partition.
+    # The root partition will be set to 105% of the image's size to account for ext4 filesystem overhead.
+    local image_bytes image_size
+    image_bytes=$(stat --printf="%s" "$IMAGE")
+    image_size=$(div_round_up "$image_bytes" sector_bytes)
+
+    image_size=$((image_size + image_size / 20))
+
+    local -r persistence_size=$((PERSISTENCE_SIZE * sMiB))
+
+    info "image has size $(prettyb "$image_bytes") corresponding to $(prettyn "$image_size") sectors"
+    info "requested persistence partition of size $(prettyb "$PERSISTENCE_SIZE") corresponding to $(prettyn "$persistence_size") sectors"
+
+    # Determine the start and end sectors of each partition, and the size of the data partition,
+    # which is the remaining free space. Note the 1MiB start offset, to leave space for partition table.
+    local start="$sMiB"
+
+    # Partition for grub requires 1MiB, and boot partition of 300MiB is standard.
+    # Keep 1MiB unformatted at the start for the partition table.
+    # Validate the device has sufficient size for what's been requested.
+    declare -a sizes=( $((1 * sMiB)) $((300 * sMiB)) "$image_size" "$persistence_size" )
+
+    local sum
+    sum=$(IFS=+; echo "$((sMiB + ${sizes[*]}))")
+
+    # The last 33 sectors are reserved in devices with GPT partition tables.
+    local nsectors
+    nsectors=$(( $(blockdev --getsize "$DISK") - 33 ))
+
+    if [ "$sum" -ge "$nsectors" ]; then
+        error "insufficient size for all partitions with given image and persistence partition size ($(prettyn nsectors) <= $(prettyn sum))"
+        exit "$EX_DATAERR"
+    fi
+
+    info "device has $nsectors sectors, of which $sum will be used for grub, bios, root and casper partitions"
+    info ""
+
+    # Prepend the array with the storage partition size, then determine start and end sectors for all partitions.
+    sizes=( $((nsectors - sum)) "${sizes[@]}" )
+
+    declare -a starts ends
+    for i in ${!sizes[@]}; do
+        size=${sizes[$i]}
+
+        starts+=( "$start" )
+        start=$((start + size))
+        ends+=( $((start - 1)) )
+
+        info "partition $i: starts at sector $(prettyn "${starts[$i]}") and ends at sector $(prettyn "${ends[$i]}") (size of $(prettyn "${sizes[$i]}") sectors)"
+    done
+
+    info ""
+
+    # Return the partition definitions.
+    declare -ar names=( "data" "BIOS" "EFI" "root" "casper-rw" )
+    declare -ar filesystems=( "ntfs" '""' "fat32" "ext4" "ext4" )
+    declare -ar flags=( "" "bios_grub" "boot esp" "" "" )
+
+    for i in ${!sizes[@]}; do
+        info "${names[$i]} ${filesystems[$i]} ${starts[$i]} ${ends[$i]} ${flags[$i]}"
+        echo "${names[$i]} ${filesystems[$i]} ${starts[$i]} ${ends[$i]} ${flags[$i]}"
+    done
+
+    info ""
+}
+
+make_partitions () {
+    # Reads partition information from STDIN and creates the requested partitions
+    # and filesystems in the given device. The information read from STDIN is
+    # expected one per line, in the following format:
+    #  NAME FILESYSTEM_TYPE START_SECTOR END_SECTOR [FLAG]...
+    #
+    # Uses the following global variables:
+    #  $DISK             - the given block device
+
+    # Create partition table and partitions
+    local parted_cmds mkfs_calls partition
+
+    info "preparing parted commands and mkfs calls"
+
+    local i=1
+    while read -r name fs start end flags; do
+        parted_cmds+=" mkpart $name $fs ${start}s ${end}"
+
+        info " mkpart $name $fs $start $end"
+
+        for flag in $flags; do
+            parted_cmds+=" set $i $flag on"
+
+            info "  set $i $flag on"
+        done
+
+        partition="$(get_partition_name "$DISK" "$i")"
+
+        case "$fs" in
+            ""|'""')
+                ;; # Unformatted partition.
+
+            fat*)
+                mkfs_calls+="mkfs -t fat -F $(cut -c 4- <(echo "$fs")) -S $(blockdev --getpbsz "$DISK") $partition; "
+                ;;
+
+            ntfs)
+                mkfs_calls+="mkntfs --fast -L $name $partition; "
+                ;;
+
+            ext*)
+                mkfs_calls+="mkfs -t $fs -q -L $name $partition; "
+                ;;
+
+            *)
+                error "unsupported filesystem $fs"
+                exit "$EX_DATAERR"
+                ;;
+        esac
+
+        i=$((i + 1))
+    done
+
+    info ""
+
+    if [ "$i" -eq 1 ]; then
+        error "no partitions defined for creation on given device"
+        exit "$EX_DATAERR"
+    fi
+    
+    info $(echo "$mkfs_calls" | sed 's/; /\\n/g')
+
+    parted -s "$DISK" unit s mklabel gpt $parted_cmds
+    eval "$mkfs_calls"
+
+    info "partitions created and filesystems set up"
+    info ""
+}
+
+copy_iso_contents () {
+    # Copies the contents of the os image to the root partition,
+    # and the boot and EFI folders to the boot partition.
+    #  $1 - the boot partition name
+    #  $2 - the root partition name
+    #
+    # Uses the following global variables:
+    #  $DISK             - the given block device
+    #  $IMAGE            - the given os image
+
+    local -r boot="$1" root="$2"
+
+    # Mount the boot partition, root partition and the os image.
+    mkdir -p /mnt/usb-boot /mnt/usb-root /mnt/iso
+    mount "$boot" /mnt/usb-boot
+    mount "$root" /mnt/usb-root
+    mount -o loop "$IMAGE" /mnt/iso
+
+    info "mounted $boot at /mnt/usb-boot, $root at /mnt/usb-root, and $IMAGE at /mnt/iso"
+
+    # Copy the image contents to root partition.
+    info "copying $IMAGE contents to $root..."
+
+    cp -a /mnt/iso/. /mnt/usb-root
+
+    info "done"
+
+    # Copy boot and EFI folders from image to boot partition.
+    cp -r /mnt/iso/boot /mnt/usb-boot
+    cp -r /mnt/iso/EFI  /mnt/usb-boot
+
+    info "copied boot and EFI folders to boot partition"
+
+    # Clean up.
+    umount "$IMAGE"
+    umount "$root"
+    umount "$boot"
+
+    rm -rf /mnt/iso /mnt/usb-boot /mnt/usb-root
+
+    info "unmounted image and partitions and removed mount points"
+}
+
+install_grub () {
+    # Installs grub on the given partition. The grub config is also modified to set the kernel's
+    # persistence flag, and the grub menu's resolution (making it readable in 4k monitors).
+    # $1 - the grub partition name
+    # $2 - the boot partition name
+    # $3 - the index of the root partition in the device
+
+    local -r grub="$1" boot="$2"
+
+    # Mount the boot partition.
+    mkdir -p /mnt/usb-boot
+    mount "$boot" /mnt/usb-boot
+
+    # Prepend new settings and add kernel persistence flag.
+    local -r grub_config="\
+set root=(hd0,$3)
+set gfxmode=640x480,auto
+
+$(cat /mnt/usb-boot/boot/grub/grub.cfg)"
+
+    echo "$grub_config" > /mnt/usb-boot/boot/grub/grub.cfg
+
+    sed -i "/^\tlinux/ { s/$/persistent/; :a; n; ba; }" /mnt/usb-boot/boot/grub/grub.cfg
+
+    # Install grub.
+    grub-install --boot-directory=/mnt/usb-boot/boot --efi-directory=/mnt/usb-boot/EFI "$grub"
+
+    # Clean up.
+    umount "$boot"
+    rm -rf /mnt/usb-boot
+}
+
+# Utilities
+
+div_round_up () {
+    # Perform integer division of $1 by $2, rounding up.
+    #  $1 - numerator
+    #  $2 - denominator
+    echo $((($1 + $2 - 1) / $2))
+}
+
+get_partition_name () {
+    # Get partition at the given index on the given device.
+    #  $1 - the partition's device
+    #  $2 - the index of the partition in the device
+
+    if [[ $1 =~ [0-9]$ ]]; then
+        echo "$1"p"$2"
+    else
+        echo "$1$2"
+    fi
+}
+
+info () {
+    if [ "$VERBOSE" ]; then
+        echo -e "$*" > "$TTY"
+    fi
+}
+
+error () {
+    echo "$0: $*" > "$TTY"
+}
+
+
+prettyb () {
+    numfmt --to iec-i "$*"
+}
+
+prettyn () {
+    numfmt --to si "$*"
+}
+
+main "$@"
