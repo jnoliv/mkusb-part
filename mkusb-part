@@ -19,18 +19,16 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Credits:
+# * The authors of 'sgdisk' for writing such a great tool and documentation:
+#   http://www.rodsbooks.com/gdisk/
 # * C. S. Cameron for sending me down the right path with this great 'ask Ubuntu' answer:
 #   https://askubuntu.com/a/1284930
-# * mook765 for succintly explaining how GPT partition tables reserve sectors at both start and end of devices:
-#   https://askubuntu.com/a/1145468
 # * The Geek Diary for this handy tutorial on loopback devices:
 #   https://www.thegeekdiary.com/how-to-create-virtual-block-device-loop-device-filesystem-in-linux/
 
 # TODO:
 # * accept IEC units for -p argument
 #     > echo "$@" | sed 's/B$//' | numfmt --from iec-i
-# * increase partition sizes up (except storage partition, which would be decreased) to the next multiple of alignment
-#     > blockdev --getalignoff "$DISK"
 # * fail if any of the device's partitions are mounted
 # * add -f, --force option which unmounts any mounted device's partitions
 # * option to get partition definition from file / stdin?
@@ -39,6 +37,7 @@
 # * can the calls to mkfs be more generic to easily support most filesystem types, with the exception of ntfs?
 # * test mode which creates a loopback device of given size, prints the device path and exits (-t --test ?) (option to clean up?)
 # * add tab completion support?
+# * add support for encrypted storage partition
 
 set -euo pipefail
 
@@ -48,9 +47,17 @@ declare -r VERSION='0.1'
 declare -r EX_USAGE=64      # command line usage error
 declare -r EX_DATAERR=65    # data format error
 
+# GPT partition type GUIDs.
+declare -r BIOS='21686148-6449-6E6F-744E-656564454649'
+declare -r EFI='C12A7328-F81F-11D2-BA4B-00A0C93EC93B'
+declare -r LINUX='0FC63DAF-8483-4772-8E79-3D69D8477DE4'
+declare -r MSDATA='EBD0A0A2-B9E5-4433-87C0-68B6B72699C7'
+
+# Couple of units for easier conversions.
 declare -r MiB=1048576
 declare -r GiB=1073741824
 
+# Get the tty file descriptor to allow logging anywhere.
 declare -r TTY=$(tty)
 
 usage () {
@@ -66,6 +73,11 @@ Options:
 
  -h, --help                 display this help
      --version              display version
+
+Return Values:
+  0    normal program execution
+ 64    incorrect arguments
+ 65    incorrect data provided
 "
 
     exit "$1"
@@ -74,17 +86,17 @@ Options:
 main () {
     parse_args "$@"    
 
-    declare -r parts=$(define_partitions)
+    declare -r parts=$(default_partitions)
     echo "$parts" | make_partitions
 
-    local -r boot_index=$(awk '/boot/{ print NR; exit }' <(echo "$parts"))
-    local -r root_index=$(awk '/root/{ print NR; exit }' <(echo "$parts"))
+    local -r boot_index=$(echo "$parts" | grep -m 1 "$EFI" | cut -f1 -d' ')
+    local -r root_index=$(echo "$parts" | grep -m 1 "root" | cut -f1 -d' ')
 
     local -r boot_name="$(get_partition_name "$DISK" "$boot_index")"
 
     copy_iso_contents "$boot_name" "$(get_partition_name "$DISK" "$root_index")"
 
-    local -r grub_index=$(awk '/bios_grub/{ print NR; exit }' <(echo "$parts"))
+    local -r grub_index=$(echo "$parts" | grep -m 1 "$BIOS" | cut -f1 -d' ')
     install_grub "$(get_partition_name "$DISK" "$grub_index")" "$boot_name" "$root_index"
 }
 
@@ -164,133 +176,109 @@ parse_args () {
     info ""
 }
 
-define_partitions () {
-    # Defines the partitions to be created in the device. Uses the following global variables:
-    #  $DISK             - the given block device
-    #  $IMAGE            - the given os image
+default_partitions () {
+    # Returns the default configuration of partitions to create in the device.
+    # Uses the following global variables:
     #  $PERSISTENCE_SIZE - the size of the casper-rw persistence partition
-    #
-    # Returns information on the partitions, one per line, in the following format:
-    #  NAME FILESYSTEM_TYPE START_SECTOR END_SECTOR [FLAG]...
-
-    # Determine the number of bytes per sector, then how many sectors are in a MiB and a GiB.
-    # This allows using sizes in sectors, facilitating the use of gparted and good memory alignment.
-    local sector_bytes
-    sector_bytes=$(blockdev --getpbsz "$DISK")
-
-    local -r sMiB=$((MiB / sector_bytes))
-    local -r sGiB=$((GiB / sector_bytes))
-
-    info "$sector_bytes bytes per sector"
 
     # Determine the size of the image, as that dictates the size of root partition.
     # The root partition will be set to 105% of the image's size to account for ext4 filesystem overhead.
-    local image_bytes image_size
-    image_bytes=$(stat --printf="%s" "$IMAGE")
-    image_size=$(div_round_up "$image_bytes" sector_bytes)
+    local -r img_size=$(( $(stat --printf="%s" "$IMAGE") * 21/20 / MiB))MiB
 
-    image_size=$((image_size + image_size / 20))
+    info "image size is $img_size"
 
-    local -r persistence_size=$((PERSISTENCE_SIZE * sMiB))
-
-    info "image has size $(prettyb "$image_bytes") corresponding to $(prettyn "$image_size") sectors"
-    info "requested persistence partition of size $(prettyb "$PERSISTENCE_SIZE") corresponding to $(prettyn "$persistence_size") sectors"
-
-    # Determine the start and end sectors of each partition, and the size of the data partition,
-    # which is the remaining free space. Note the 1MiB start offset, to leave space for partition table.
-    local start="$sMiB"
-
-    # Partition for grub requires 1MiB, and boot partition of 300MiB is standard.
-    # Keep 1MiB unformatted at the start for the partition table.
-    # Validate the device has sufficient size for what's been requested.
-    declare -a sizes=( $((1 * sMiB)) $((300 * sMiB)) "$image_size" "$persistence_size" )
-
-    local sum
-    sum=$(IFS=+; echo "$((sMiB + ${sizes[*]}))")
-
-    # The last 33 sectors are reserved in devices with GPT partition tables.
-    local nsectors
-    nsectors=$(( $(blockdev --getsize "$DISK") - 33 ))
-
-    if [ "$sum" -ge "$nsectors" ]; then
-        error "insufficient size for all partitions with given image and persistence partition size ($(prettyn nsectors) <= $(prettyn sum))"
-        exit "$EX_DATAERR"
-    fi
-
-    info "device has $nsectors sectors, of which $sum will be used for grub, bios, root and casper partitions"
-    info ""
-
-    # Prepend the array with the storage partition size, then determine start and end sectors for all partitions.
-    sizes=( $((nsectors - sum)) "${sizes[@]}" )
-
-    declare -a starts ends
-    for i in ${!sizes[@]}; do
-        size=${sizes[$i]}
-
-        starts+=( "$start" )
-        start=$((start + size))
-        ends+=( $((start - 1)) )
-
-        info "partition $i: starts at sector $(prettyn "${starts[$i]}") and ends at sector $(prettyn "${ends[$i]}") (size of $(prettyn "${sizes[$i]}") sectors)"
-    done
-
-    info ""
-
-    # Return the partition definitions.
-    declare -ar names=( "data" "BIOS" "EFI" "root" "casper-rw" )
-    declare -ar filesystems=( "ntfs" '""' "fat32" "ext4" "ext4" )
-    declare -ar flags=( "" "bios_grub" "boot esp" "" "" )
-
-    for i in ${!sizes[@]}; do
-        info "${names[$i]} ${filesystems[$i]} ${starts[$i]} ${ends[$i]} ${flags[$i]}"
-        echo "${names[$i]} ${filesystems[$i]} ${starts[$i]} ${ends[$i]} ${flags[$i]}"
-    done
-
-    info ""
+    echo "\
+2 BIOS       $BIOS   none  1MiB
+3 EFI        $EFI    fat32 300MiB
+4 root       $LINUX  ext4  $img_size
+5 casper-rw  $LINUX  ext4  ${PERSISTENCE_SIZE}MiB
+1 USB\ Data  $MSDATA ntfs  0"
 }
 
 make_partitions () {
     # Reads partition information from STDIN and creates the requested partitions
-    # and filesystems in the given device. The information read from STDIN is
-    # expected one per line, in the following format:
-    #  NAME FILESYSTEM_TYPE START_SECTOR END_SECTOR [FLAG]...
+    # and filesystems in the given device. Uses the following global variables:
+    #  $DISK - the given block device
     #
-    # Uses the following global variables:
-    #  $DISK             - the given block device
+    # The partition information read from STDIN is expected one per line, in the
+    # following format:
+    #  INDEX NAME TYPE FILESYSTEM_TYPE SIZE [FLAG]...
+    #
+    # The INDEX is in relation to the partition in the partition table. In the
+    # device, partitions will be in the order they appear in the list. For example,
+    #  2 part1 ...
+    #  1 part2 ...
+    # would result in the disk starting with part1 and then part2, but part2 would
+    # appear first in the partition table. Note it is 1-based.
+    #
+    # If NAME contains spaces they must be escaped. It is used for both the
+    # partition name and, for ntf or ext* filesystems, the filesystem's label.
+    #
+    # The TYPE is the partition's GPT partition type GUID.
+    #
+    # The valid values of FILESYSTEM_TYPE are none, fat12, fat16, fat32, ntfs, ext2,
+    # ext3, and ext4, where none means no filesystem will be created in the partition.
+    #
+    # A partition's SIZE must be given in IEC-I format (KiB, MiB, GiB...). The last
+    # partition can have its SIZE set to 0, in which case all remaining space is used.
+    #
+    # The optional FLAG list is a space separated list of integers, with valid values
+    # between 0 and 63. These correspond to the GPT attribute flags to be set for the
+    # partition.
 
-    # Create partition table and partitions
-    local parted_cmds mkfs_calls partition
+    local -r stdin=$(cat)
+    info "Creating the following partitions:"
+    info "$stdin"
 
-    info "preparing parted commands and mkfs calls"
+    # Delete existing partition table and create new partitions.
+    sgdisk -Z "$DISK"
 
-    local i=1
-    while read -r name fs start end flags; do
-        parted_cmds+=" mkpart $name $fs ${start}s ${end}"
+    while read i name type _fs size flags; do
+        local new
 
-        info " mkpart $name $fs $start $end"
+        # Handle SIZE 0.
+        if [ "$size" == "0" ]; then
+            new="-N $i"
+        else
+            # sgdisk takes in sizes suffixed with K, M, G, etc, to mean KiB, MiB, GiB, etc.
+            size="${size::-2}"
 
-        for flag in $flags; do
-            parted_cmds+=" set $i $flag on"
+            new="-n $i:0:+$size"
+        fi
 
-            info "  set $i $flag on"
-        done
+        # Handle flags.
+        local attribs=""
+        if [ -n "$flags" ]; then
+            attribs="$(printf -- "-A $i:set:%s " $flags)"
+        fi
 
-        partition="$(get_partition_name "$DISK" "$i")"
+        sgdisk $new -c "$i":"$name" -t "$i":"$type" $attribs "$DISK"
+    done <<< "$stdin"
+
+    # Since partitions can be given in different order than they will appear in the partition
+    # table, it's easier to create all partitions and then create all filesystems than trying
+    # to figure out the path of each partition as they are created.
+
+    # Create filesystems.
+    while read i name _type fs _size _flags; do
+        local part
+        part="$(get_partition_name "$DISK" "$i")"
 
         case "$fs" in
-            ""|'""')
+            none)
                 ;; # Unformatted partition.
 
             fat*)
-                mkfs_calls+="mkfs -t fat -F $(cut -c 4- <(echo "$fs")) -S $(blockdev --getpbsz "$DISK") $partition; "
+                info "fat type \"${fs:3}\""
+                mkfs -t fat -F "${fs:3}" -S $(blockdev --getpbsz "$DISK") "$part"
                 ;;
 
             ntfs)
-                mkfs_calls+="mkntfs --fast -L $name $partition; "
+                mkntfs --fast -L "$name" "$part"
                 ;;
 
             ext*)
-                mkfs_calls+="mkfs -t $fs -q -L $name $partition; "
+                mkfs -t "$fs" -q -L "$name" "$part"
                 ;;
 
             *)
@@ -298,24 +286,7 @@ make_partitions () {
                 exit "$EX_DATAERR"
                 ;;
         esac
-
-        i=$((i + 1))
-    done
-
-    info ""
-
-    if [ "$i" -eq 1 ]; then
-        error "no partitions defined for creation on given device"
-        exit "$EX_DATAERR"
-    fi
-    
-    info $(echo "$mkfs_calls" | sed 's/; /\\n/g')
-
-    parted -s "$DISK" unit s mklabel gpt $parted_cmds
-    eval "$mkfs_calls"
-
-    info "partitions created and filesystems set up"
-    info ""
+    done <<< "$stdin"
 }
 
 copy_iso_contents () {
@@ -334,7 +305,7 @@ copy_iso_contents () {
     mkdir -p /mnt/usb-boot /mnt/usb-root /mnt/iso
     mount "$boot" /mnt/usb-boot
     mount "$root" /mnt/usb-root
-    mount -o loop "$IMAGE" /mnt/iso
+    mount -r -o loop "$IMAGE" /mnt/iso
 
     info "mounted $boot at /mnt/usb-boot, $root at /mnt/usb-root, and $IMAGE at /mnt/iso"
 
@@ -386,7 +357,7 @@ $(cat /mnt/usb-boot/boot/grub/grub.cfg)"
     sed -i "/^\tlinux/ { s/$/persistent/; :a; n; ba; }" /mnt/usb-boot/boot/grub/grub.cfg
 
     # Install grub.
-    grub-install --boot-directory=/mnt/usb-boot/boot --efi-directory=/mnt/usb-boot/EFI "$grub"
+    grub-install --removable --boot-directory=/mnt/usb-boot/boot --efi-directory=/mnt/usb-boot/EFI "$grub"
 
     # Clean up.
     umount "$boot"
@@ -394,13 +365,6 @@ $(cat /mnt/usb-boot/boot/grub/grub.cfg)"
 }
 
 # Utilities
-
-div_round_up () {
-    # Perform integer division of $1 by $2, rounding up.
-    #  $1 - numerator
-    #  $2 - denominator
-    echo $((($1 + $2 - 1) / $2))
-}
 
 get_partition_name () {
     # Get partition at the given index on the given device.
@@ -424,13 +388,9 @@ error () {
     echo "$0: $*" > "$TTY"
 }
 
-
 prettyb () {
-    numfmt --to iec-i "$*"
-}
-
-prettyn () {
-    numfmt --to si "$*"
+    local -r n=$(numfmt --to iec-i "$*")
+    echo "$n"B
 }
 
 main "$@"
