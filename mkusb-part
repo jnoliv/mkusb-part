@@ -156,12 +156,12 @@ parse_args () {
 
     # Positional arguments.
     if [ -z "$1" ] || ! [ -f "$1" ] || [[ "$1" != *.iso ]]; then
-        error "second position argument is missing or is not an iso file"
+        error "first position argument is missing or is not an iso file"
         usage "$EX_USAGE"
     fi
 
     if [ -z "$2" ] || ! [ -b "$2" ]; then
-        error "first positional argument is missing or is not a block device"
+        error "second positional argument is missing or is not a block device"
         usage "$EX_USAGE"
     fi
 
