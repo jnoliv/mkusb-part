@@ -29,7 +29,6 @@
 #   https://forums.fedoraforum.org/showthread.php?321014-Increase-Boot-Menu-Font-Size&p=1838802#post1838802
 
 # TODO v0.2:
-# * fix verbose output without -v option
 # * stop subcommands from printing their output to stdin (at least if -v not present)
 # * accept IEC units for -p argument
 #     > echo "$@" | sed 's/B$//' | numfmt --from iec-i
@@ -396,7 +395,7 @@ get_partition_name () {
 }
 
 info () {
-    if [ "$VERBOSE" ]; then
+    if $VERBOSE; then
         echo -e "$*" > "$TTY"
     fi
 }
