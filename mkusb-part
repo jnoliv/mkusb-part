@@ -29,8 +29,6 @@
 #   https://forums.fedoraforum.org/showthread.php?321014-Increase-Boot-Menu-Font-Size&p=1838802#post1838802
 
 # TODO v0.2:
-# * fail if any of the device's partitions are mounted
-# * add -f, --force option which unmounts any mounted device's partitions
 # * option to get partition definition from file / stdin?
 #
 # TODO v0.3:
@@ -51,7 +49,10 @@ set -euo pipefail
 
 declare -r VERSION='0.1'
 
-# See /usr/include/sysexits.h
+# Exit codes. The values greater than 63, as well as 0, are
+# identical to the definitions in '/usr/include/sysexits.h'.
+declare -r EX_OK=0          # successful termination
+declare -r EX_MOUNTED=1     # device has mounted partitions
 declare -r EX_USAGE=64      # command line usage error
 declare -r EX_DATAERR=65    # data format error
 
@@ -75,6 +76,7 @@ Usage: $0 [OPTION]... IMAGE DEVICE
 Make DEVICE bootable using the operating system in IMAGE with casper persistence and windows compatible storage.
 
 Options:
+ -f, --force                attempt to unmount any mounted partitions on the given device
  -p, --persistence=SIZE     the size, in MiB, of the persistence partition (default 4GiB)
  -v, --verbose              show details of operations as they are executed
 
@@ -83,6 +85,7 @@ Options:
 
 Return Values:
   0    normal program execution
+  1    device has mounted partitions
  64    incorrect arguments
  65    incorrect data provided
 "
@@ -92,6 +95,7 @@ Return Values:
 
 main () {
     parse_args "$@"
+    validate
 
     declare -r parts=$(default_partitions)
     echo "$parts" | make_partitions
@@ -117,8 +121,8 @@ parse_args () {
     #  PERSISTENCE_SIZE
     #  VERBOSE
 
-    local -r options="p:vh"
-    local -r long="persistence:,verbose,help,version"
+    local -r options="fp:vh"
+    local -r long="force,persistence:,verbose,help,version"
 
     local args
 
@@ -133,8 +137,12 @@ parse_args () {
     while true; do
         case "$1" in
             -h|--help)
-                usage 0;;
+                usage "$EX_OK";;
             
+            -f|--force)
+                declare -r force=true
+                shift;;
+
             -p|--persistent)
                 if ! [[ $2 =~ ^[0-9]+([KMGTPEZY]i)?B$ ]]; then
                     error "optional argument $1 must be succeeded by a valid IEC unit (B, KiB, MiB, GiB...)"
@@ -150,7 +158,7 @@ parse_args () {
             
             --version)
                 echo "$0 v$VERSION"
-                exit 0;;
+                exit "$EX_OK";;
 
             --)
                 shift
@@ -158,6 +166,7 @@ parse_args () {
         esac
     done
 
+    declare -gr FORCE="${force:=false}"
     declare -gr PERSISTENCE_SIZE="${persistence_size:=4GiB}"
     declare -gr VERBOSE="${verbose:=false}"
 
@@ -181,6 +190,31 @@ parse_args () {
     info " DISK=$DISK"
     info " IMAGE=$IMAGE"
     info ""
+}
+
+validate () {
+    # Validate that the user requested actions are possible.
+    # Uses the following global variables:
+    #  $DISK             - the given block device
+    #  $FORCE            - attempt to unmount device's mounted partitions
+    #  $PERSISTENCE_SIZE - the size of the casper-rw persistence partition
+
+    # Check if any of DISKs partitions are mounted.
+    local -r mounted=$(df | grep "$DISK" | cut -d' ' -f1)
+
+    if [ -n "$mounted" ]; then
+        if ! $FORCE; then
+            error "device $DISK has mounted partitions:\n$mounted"
+            usage "$EX_MOUNTED"
+        fi
+
+        for p in $mounted; do
+            umount "$p"
+            info "unmounted $p"
+        done
+
+        info ""
+    fi
 }
 
 default_partitions () {
@@ -237,6 +271,7 @@ make_partitions () {
     local -r stdin=$(cat)
     info "Creating the following partitions:"
     info "$stdin"
+    info ""
 
     # Delete existing partition table and create new partitions.
     sgdisk -Z "$DISK" > /dev/null
@@ -277,7 +312,7 @@ make_partitions () {
                 ;; # Unformatted partition.
 
             fat*)
-                mkfs.fat -F "${fs:3}" -S $(blockdev --getpbsz "$DISK") "$part" > /dev/null
+                mkfs.fat -F "${fs:3}" -S "$(blockdev --getpbsz "$DISK")" "$part" > /dev/null
                 ;;
 
             ntfs)
@@ -303,8 +338,8 @@ copy_iso_contents () {
     #  $2 - the root partition name
     #
     # Uses the following global variables:
-    #  $DISK             - the given block device
-    #  $IMAGE            - the given os image
+    #  $DISK  - the given block device
+    #  $IMAGE - the given os image
 
     local -r boot="$1" root="$2"
 
@@ -338,6 +373,7 @@ copy_iso_contents () {
     rm -rf /mnt/iso /mnt/usb-boot /mnt/usb-root
 
     info "unmounted image and partitions and removed mount points"
+    info ""
 }
 
 install_grub () {
@@ -353,6 +389,8 @@ install_grub () {
     mkdir -p /mnt/usb-boot
     mount "$boot" /mnt/usb-boot
 
+    info "mounted $boot at /mnt/usb-boot"
+
     # Prepend new settings and add kernel persistence flag.
     local -r grub_config="\
 set root=(hd0,$3)
@@ -366,16 +404,23 @@ $(cat /mnt/usb-boot/boot/grub/grub.cfg)"
 
     sed -i "/^\tlinux/ { s/$/persistent/; :a; n; ba; }" /mnt/usb-boot/boot/grub/grub.cfg
 
+    info "modified grub configuration"
+
     # Install grub.
     grub-install --removable --uefi-secure-boot \
         --boot-directory=/mnt/usb-boot/boot \
         --efi-directory=/mnt/usb-boot/EFI "$grub" \
         &> /dev/null
 
+    info "installed grub to $grub"
+
     # Clean up.
     sync "$boot"
     umount "$boot"
     rm -rf /mnt/usb-boot
+
+    info "unmounted $boot and removed mount point"
+    info ""
 }
 
 # Utilities
@@ -399,7 +444,7 @@ info () {
 }
 
 error () {
-    echo "$0: $*" > "$TTY"
+    echo -e "$0: $*" > "$TTY"
 }
 
 main "$@"
