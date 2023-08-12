@@ -28,12 +28,8 @@
 # * starfall42 on this 'fedora forum' post, for giving me the answer to why changing grub resolution wasn't working:
 #   https://forums.fedoraforum.org/showthread.php?321014-Increase-Boot-Menu-Font-Size&p=1838802#post1838802
 
-# TODO v0.2:
-# * option to get partition definition from file / stdin?
-#
 # TODO v0.3:
 # * option for no storage partition, using all possible space for the persistence partition
-# * option to set the image size or ext4 overhead percentage?
 # * can the calls to mkfs be more generic to easily support most filesystem types, with the exception of ntfs?
 # * test mode which creates a loopback device of given size, prints the device path and exits (-t --test ?) (option to clean up?)
 #
@@ -47,7 +43,7 @@
 
 set -euo pipefail
 
-declare -r VERSION='0.1'
+declare -r VERSION='0.2'
 
 # Exit codes. The values greater than 63, as well as 0, are
 # identical to the definitions in '/usr/include/sysexits.h'.
@@ -65,9 +61,6 @@ declare -r MSDATA='EBD0A0A2-B9E5-4433-87C0-68B6B72699C7'
 # Number of bytes in a mebibyte.
 declare -r MiB=1048576
 
-# Get the tty file descriptor to allow logging anywhere.
-declare -r TTY=$(tty)
-
 usage () {
     echo \
 "
@@ -77,17 +70,45 @@ Make DEVICE bootable using the operating system in IMAGE with casper persistence
 
 Options:
  -f, --force                attempt to unmount any mounted partitions on the given device
+ -i, --input[=FILE]         read partition definition from given file, or stdin if no file given
  -p, --persistence=SIZE     the size, in MiB, of the persistence partition (default 4GiB)
  -v, --verbose              show details of operations as they are executed
 
  -h, --help                 display this help
      --version              display version
 
+  Note: options are parsed using getopt (1), if options are not being parsed as expected try reading man getopt.
+
 Return Values:
   0    normal program execution
   1    device has mounted partitions
  64    incorrect arguments
  65    incorrect data provided
+
+Partition Definition:
+  The partition information read from STDIN is expected one per line, in the following format:
+   INDEX NAME TYPE FILESYSTEM_TYPE SIZE [FLAG]...
+ 
+  The INDEX is in relation to the partition in the partition table. In the device, partitions will be in the order they
+  appear in the list. For example,
+   2 part1 ...
+   1 part2 ...
+  would result in the disk starting with part1 and then part2, but part2 would appear first in the partition table. Note
+  it is 1-based.
+ 
+  If NAME contains spaces they must be escaped. It is used for both the partition name and, for ntf or ext* filesystems,
+  the filesystem's label.
+ 
+  The TYPE is the partition's GPT partition type GUID.
+ 
+  The valid values of FILESYSTEM_TYPE are none, fat12, fat16, fat32, ntfs, ext2, ext3, and ext4, where none means no
+  filesystem will be created in the partition.
+ 
+  A partition's SIZE must be given in IEC-I format (KiB, MiB, GiB...). The last partition can have its SIZE set to 0, in
+  which case all remaining space is used.
+ 
+  The optional FLAG list is a space separated list of integers, with valid values between 0 and 63. These correspond to
+  the GPT attribute flags to be set for the partition.
 "
 
     exit "$1"
@@ -97,7 +118,12 @@ main () {
     parse_args "$@"
     validate
 
-    declare -r parts=$(default_partitions)
+    if [ -z "$INPUT" ]; then
+        local -r parts=$(default_partitions)
+    else
+        local -r parts=$(cat $INPUT)
+    fi
+
     echo "$parts" | make_partitions
 
     local -r boot_index=$(echo "$parts" | grep -m 1 "$EFI" | cut -f1 -d' ')
@@ -121,13 +147,13 @@ parse_args () {
     #  PERSISTENCE_SIZE
     #  VERBOSE
 
-    local -r options="fp:vh"
-    local -r long="force,persistence:,verbose,help,version"
+    local -r options="fi::p:vh"
+    local -r long="force,input:,persistence:,verbose,help,version"
 
     local args
 
-    # Optional arguments. Note the sed command allowing support for '=' in long options by replacing them with ' '.
-    args=$(getopt --name "$0" --options="$options" --long="$long" -- $(sed -E 's/(--[a-z]+)=([^ ]+)/\1 \2/g' <(echo "$@")))
+    # Optional arguments.
+    args=$(getopt --name "$0" --options=+"$options" --longoptions="$long" -- $@)
     if [ $? -ne 0 ]; then
         usage "$EX_USAGE"
     fi
@@ -140,8 +166,17 @@ parse_args () {
                 usage "$EX_OK";;
             
             -f|--force)
-                declare -r force=true
+                local -r force=true
                 shift;;
+
+            -i|--input)
+                if [[ $2 =~ ^- ]]; then
+                    local -r input=/dev/stdin
+                else
+                    local -r input="$2"
+                fi
+
+                shift 2;;
 
             -p|--persistent)
                 if ! [[ $2 =~ ^[0-9]+([KMGTPEZY]i)?B$ ]]; then
@@ -153,7 +188,7 @@ parse_args () {
                 shift 2;;
 
             -v|--verbose)
-                declare -r verbose=true
+                local -r verbose=true
                 shift;;
             
             --version)
@@ -166,6 +201,7 @@ parse_args () {
         esac
     done
 
+    declare -gr INPUT="${input:-}"
     declare -gr FORCE="${force:=false}"
     declare -gr PERSISTENCE_SIZE="${persistence_size:=4GiB}"
     declare -gr VERBOSE="${verbose:=false}"
@@ -185,6 +221,8 @@ parse_args () {
     declare -gr DISK=$2
 
     info "running $0 with the following options:"
+    info " FORCE=$FORCE"
+    info " INPUT=$INPUT"
     info " PERSISTENCE_SIZE=$PERSISTENCE_SIZE"
     info " VERBOSE=$VERBOSE"
     info " DISK=$DISK"
@@ -241,32 +279,6 @@ make_partitions () {
     # Reads partition information from STDIN and creates the requested partitions
     # and filesystems in the given device. Uses the following global variables:
     #  $DISK - the given block device
-    #
-    # The partition information read from STDIN is expected one per line, in the
-    # following format:
-    #  INDEX NAME TYPE FILESYSTEM_TYPE SIZE [FLAG]...
-    #
-    # The INDEX is in relation to the partition in the partition table. In the
-    # device, partitions will be in the order they appear in the list. For example,
-    #  2 part1 ...
-    #  1 part2 ...
-    # would result in the disk starting with part1 and then part2, but part2 would
-    # appear first in the partition table. Note it is 1-based.
-    #
-    # If NAME contains spaces they must be escaped. It is used for both the
-    # partition name and, for ntf or ext* filesystems, the filesystem's label.
-    #
-    # The TYPE is the partition's GPT partition type GUID.
-    #
-    # The valid values of FILESYSTEM_TYPE are none, fat12, fat16, fat32, ntfs, ext2,
-    # ext3, and ext4, where none means no filesystem will be created in the partition.
-    #
-    # A partition's SIZE must be given in IEC-I format (KiB, MiB, GiB...). The last
-    # partition can have its SIZE set to 0, in which case all remaining space is used.
-    #
-    # The optional FLAG list is a space separated list of integers, with valid values
-    # between 0 and 63. These correspond to the GPT attribute flags to be set for the
-    # partition.
 
     local -r stdin=$(cat)
     info "Creating the following partitions:"
@@ -439,12 +451,12 @@ get_partition_name () {
 
 info () {
     if $VERBOSE; then
-        echo -e "$*" > "$TTY"
+        echo -e "$*" > /dev/tty
     fi
 }
 
 error () {
-    echo -e "$0: $*" > "$TTY"
+    echo -e "$0: $*" > /dev/tty
 }
 
 main "$@"
