@@ -29,7 +29,6 @@
 #   https://forums.fedoraforum.org/showthread.php?321014-Increase-Boot-Menu-Font-Size&p=1838802#post1838802
 
 # TODO v0.3:
-# * option for no storage partition, using all possible space for the persistence partition
 # * can the calls to mkfs be more generic to easily support most filesystem types, with the exception of ntfs?
 # * test mode which creates a loopback device of given size, prints the device path and exits (-t --test ?) (option to clean up?)
 #
@@ -71,6 +70,7 @@ Make DEVICE bootable using the operating system in IMAGE with casper persistence
 Options:
  -f, --force                attempt to unmount any mounted partitions on the given device
  -i, --input[=FILE]         read partition definition from given file, or stdin if no file given
+ -n, --no-storage           do not create a storage partition, using remaining space for persistence
  -p, --persistence=SIZE     the size, in MiB, of the persistence partition (default 4GiB)
  -v, --verbose              show details of operations as they are executed
 
@@ -147,8 +147,8 @@ parse_args () {
     #  PERSISTENCE_SIZE
     #  VERBOSE
 
-    local -r options="fi::p:vh"
-    local -r long="force,input:,persistence:,verbose,help,version"
+    local -r options="fi::np:vh"
+    local -r long="force,input:,no-storage,persistence:,verbose,help,version"
 
     local args
 
@@ -178,6 +178,10 @@ parse_args () {
 
                 shift 2;;
 
+            -n|--no-storage)
+                local -r storage=true
+                shift;;
+
             -p|--persistent)
                 if ! [[ $2 =~ ^[0-9]+([KMGTPEZY]i)?B$ ]]; then
                     error "optional argument $1 must be succeeded by a valid IEC unit (B, KiB, MiB, GiB...)"
@@ -203,6 +207,7 @@ parse_args () {
 
     declare -gr INPUT="${input:-}"
     declare -gr FORCE="${force:=false}"
+    declare -gr STORAGE="${storage:=false}"
     declare -gr PERSISTENCE_SIZE="${persistence_size:=4GiB}"
     declare -gr VERBOSE="${verbose:=false}"
 
@@ -223,6 +228,7 @@ parse_args () {
     info "running $0 with the following options:"
     info " FORCE=$FORCE"
     info " INPUT=$INPUT"
+    info " STORAGE=$storage"
     info " PERSISTENCE_SIZE=$PERSISTENCE_SIZE"
     info " VERBOSE=$VERBOSE"
     info " DISK=$DISK"
@@ -259,6 +265,7 @@ default_partitions () {
     # Returns the default configuration of partitions to create in the device.
     # Uses the following global variables:
     #  $PERSISTENCE_SIZE - the size of the casper-rw persistence partition
+    #  $STORAGE          - whether to include a storage partition
 
     # Determine the size of the image, as that dictates the size of root partition.
     # The root partition will be set to 105% of the image's size to account for ext4 filesystem overhead.
@@ -267,12 +274,24 @@ default_partitions () {
     info "partition for OS image will have size $img_size"
     info ""
 
-    echo "\
+    local -r no_storage="\
+1 BIOS       $BIOS   none  1MiB
+2 EFI        $EFI    fat32 300MiB
+3 root       $LINUX  ext4  $img_size
+4 casper-rw  $LINUX  ext4  0"
+
+    local -r default="\
 2 BIOS       $BIOS   none  1MiB
 3 EFI        $EFI    fat32 300MiB
 4 root       $LINUX  ext4  $img_size
 5 casper-rw  $LINUX  ext4  $PERSISTENCE_SIZE
 1 USB\ Data  $MSDATA ntfs  0"
+
+    if $STORAGE; then
+        echo "$no_storage"
+    else
+        echo "$default"
+    fi
 }
 
 make_partitions () {
