@@ -29,7 +29,6 @@
 #   https://forums.fedoraforum.org/showthread.php?321014-Increase-Boot-Menu-Font-Size&p=1838802#post1838802
 
 # TODO v0.2:
-# * stop subcommands from printing their output to stdin (at least if -v not present)
 # * accept IEC units for -p argument
 #     > echo "$@" | sed 's/B$//' | numfmt --from iec-i
 # * fail if any of the device's partitions are mounted
@@ -242,7 +241,7 @@ make_partitions () {
     info "$stdin"
 
     # Delete existing partition table and create new partitions.
-    sgdisk -Z "$DISK"
+    sgdisk -Z "$DISK" > /dev/null
 
     while read i name type _fs size flags; do
         local new
@@ -263,7 +262,7 @@ make_partitions () {
             attribs="$(printf -- "-A $i:set:%s " $flags)"
         fi
 
-        sgdisk $new -c "$i":"$name" -t "$i":"$type" $attribs "$DISK"
+        sgdisk $new -c "$i":"$name" -t "$i":"$type" $attribs "$DISK" > /dev/null
     done <<< "$stdin"
 
     # Since partitions can be given in different order than they will appear in the partition
@@ -280,12 +279,11 @@ make_partitions () {
                 ;; # Unformatted partition.
 
             fat*)
-                info "fat type \"${fs:3}\""
-                mkfs -t fat -F "${fs:3}" -S $(blockdev --getpbsz "$DISK") "$part"
+                mkfs.fat -F "${fs:3}" -S $(blockdev --getpbsz "$DISK") "$part" > /dev/null
                 ;;
 
             ntfs)
-                mkntfs --fast -L "$name" "$part"
+                mkntfs --fast -q -L "$name" -p 0 -H 0 -S 0 "$part"
                 ;;
 
             ext*)
@@ -334,7 +332,7 @@ copy_iso_contents () {
     info "copied boot and EFI folders to boot partition"
 
     # Clean up.
-    sync
+    sync "$root" "$boot"
     umount "$IMAGE"
     umount "$root"
     umount "$boot"
@@ -372,10 +370,12 @@ $(cat /mnt/usb-boot/boot/grub/grub.cfg)"
 
     # Install grub.
     grub-install --removable --uefi-secure-boot \
-        --boot-directory=/mnt/usb-boot/boot --efi-directory=/mnt/usb-boot/EFI "$grub"
+        --boot-directory=/mnt/usb-boot/boot \
+        --efi-directory=/mnt/usb-boot/EFI "$grub" \
+        &> /dev/null
 
     # Clean up.
-    sync
+    sync "$boot"
     umount "$boot"
     rm -rf /mnt/usb-boot
 }
