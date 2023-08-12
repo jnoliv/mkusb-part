@@ -28,7 +28,7 @@
 # * starfall42 on this 'fedora forum' post, for giving me the answer to why changing grub resolution wasn't working:
 #   https://forums.fedoraforum.org/showthread.php?321014-Increase-Boot-Menu-Font-Size&p=1838802#post1838802
 
-# TODO:
+# TODO v0.2:
 # * fix verbose output without -v option
 # * stop subcommands from printing their output to stdin (at least if -v not present)
 # * accept IEC units for -p argument
@@ -36,11 +36,17 @@
 # * fail if any of the device's partitions are mounted
 # * add -f, --force option which unmounts any mounted device's partitions
 # * option to get partition definition from file / stdin?
+#
+# TODO v0.3:
 # * option for no storage partition, using all possible space for the persistence partition
 # * option to set the image size or ext4 overhead percentage?
 # * can the calls to mkfs be more generic to easily support most filesystem types, with the exception of ntfs?
 # * test mode which creates a loopback device of given size, prints the device path and exits (-t --test ?) (option to clean up?)
+#
+# TODO v0.4:
 # * add tab completion support?
+#
+# TODO v0.5:
 # * add support for encrypted storage partition
 # * add support for creating multi-boot usb
 # * allow supplying custom grub configuration file
