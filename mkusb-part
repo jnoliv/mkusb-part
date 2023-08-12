@@ -29,8 +29,6 @@
 #   https://forums.fedoraforum.org/showthread.php?321014-Increase-Boot-Menu-Font-Size&p=1838802#post1838802
 
 # TODO v0.2:
-# * accept IEC units for -p argument
-#     > echo "$@" | sed 's/B$//' | numfmt --from iec-i
 # * fail if any of the device's partitions are mounted
 # * add -f, --force option which unmounts any mounted device's partitions
 # * option to get partition definition from file / stdin?
@@ -63,9 +61,8 @@ declare -r EFI='C12A7328-F81F-11D2-BA4B-00A0C93EC93B'
 declare -r LINUX='0FC63DAF-8483-4772-8E79-3D69D8477DE4'
 declare -r MSDATA='EBD0A0A2-B9E5-4433-87C0-68B6B72699C7'
 
-# Couple of units for easier conversions.
+# Number of bytes in a mebibyte.
 declare -r MiB=1048576
-declare -r GiB=1073741824
 
 # Get the tty file descriptor to allow logging anywhere.
 declare -r TTY=$(tty)
@@ -94,7 +91,7 @@ Return Values:
 }
 
 main () {
-    parse_args "$@"    
+    parse_args "$@"
 
     declare -r parts=$(default_partitions)
     echo "$parts" | make_partitions
@@ -139,8 +136,8 @@ parse_args () {
                 usage 0;;
             
             -p|--persistent)
-                if ! [[ $1 =~ ^[0-9]+$ ]]; then
-                    error "optional argument $1 must be succeeded by an integer"
+                if ! [[ $2 =~ ^[0-9]+([KMGTPEZY]i)?B$ ]]; then
+                    error "optional argument $1 must be succeeded by a valid IEC unit (B, KiB, MiB, GiB...)"
                     usage "$EX_USAGE"
                 fi
 
@@ -161,7 +158,7 @@ parse_args () {
         esac
     done
 
-    declare -gr PERSISTENCE_SIZE="${persistence_size:=$((4 * GiB / MiB))}"
+    declare -gr PERSISTENCE_SIZE="${persistence_size:=4GiB}"
     declare -gr VERBOSE="${verbose:=false}"
 
     # Positional arguments.
@@ -195,13 +192,14 @@ default_partitions () {
     # The root partition will be set to 105% of the image's size to account for ext4 filesystem overhead.
     local -r img_size=$(( $(stat --printf="%s" "$IMAGE") * 21/20 / MiB))MiB
 
-    info "image size is $img_size"
+    info "partition for OS image will have size $img_size"
+    info ""
 
     echo "\
 2 BIOS       $BIOS   none  1MiB
 3 EFI        $EFI    fat32 300MiB
 4 root       $LINUX  ext4  $img_size
-5 casper-rw  $LINUX  ext4  ${PERSISTENCE_SIZE}MiB
+5 casper-rw  $LINUX  ext4  $PERSISTENCE_SIZE
 1 USB\ Data  $MSDATA ntfs  0"
 }
 
@@ -402,11 +400,6 @@ info () {
 
 error () {
     echo "$0: $*" > "$TTY"
-}
-
-prettyb () {
-    local -r n=$(numfmt --to iec-i "$*")
-    echo "$n"B
 }
 
 main "$@"
