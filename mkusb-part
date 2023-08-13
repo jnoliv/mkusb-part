@@ -28,20 +28,17 @@
 # * starfall42 on this 'fedora forum' post, for giving me the answer to why changing grub resolution wasn't working:
 #   https://forums.fedoraforum.org/showthread.php?321014-Increase-Boot-Menu-Font-Size&p=1838802#post1838802
 
-# TODO v0.3:
-# * can the calls to mkfs be more generic to easily support most filesystem types, with the exception of ntfs?
-#
 # TODO v0.4:
-# * add tab completion support?
-#
-# TODO v0.5:
 # * add support for encrypted storage partition
 # * add support for creating multi-boot usb
 # * allow supplying custom grub configuration file
+#
+# TODO v0.5:
+# * add tab completion support?
 
 set -euo pipefail
 
-declare -r VERSION='0.2'
+declare -r VERSION='0.3'
 
 # Exit codes. The values greater than 63, as well as 0, are
 # identical to the definitions in '/usr/include/sysexits.h'.
