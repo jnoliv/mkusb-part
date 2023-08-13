@@ -30,7 +30,6 @@
 
 # TODO v0.3:
 # * can the calls to mkfs be more generic to easily support most filesystem types, with the exception of ntfs?
-# * test mode which creates a loopback device of given size, prints the device path and exits (-t --test ?) (option to clean up?)
 #
 # TODO v0.4:
 # * add tab completion support?
@@ -60,57 +59,92 @@ declare -r MSDATA='EBD0A0A2-B9E5-4433-87C0-68B6B72699C7'
 # Number of bytes in a mebibyte.
 declare -r MiB=1048576
 
-usage () {
+help () {
     echo \
 "
-Usage: $0 [OPTION]... IMAGE DEVICE
+USAGE:
+  $0 [OPTION]... IMAGE DEVICE
 
-Make DEVICE bootable using the operating system in IMAGE with casper persistence and windows compatible storage.
+  Make DEVICE bootable using the operating system in IMAGE with casper persistence and windows compatible storage.
+  Please read the testing section before running targetting real device.
 
-Options:
- -f, --force                attempt to unmount any mounted partitions on the given device
- -i, --input[=FILE]         read partition definition from given file, or stdin if no file given
- -n, --no-storage           do not create a storage partition, using remaining space for persistence
- -p, --persistence=SIZE     the size, in MiB, of the persistence partition (default 4GiB)
- -v, --verbose              show details of operations as they are executed
+OPTIONS:
+  -f, --force               attempt to unmount any mounted partitions on the given device
+  -i, --input[=FILE]        read partition definition from given file, or stdin if no file given
+  -n, --no-storage          do not create a storage partition, using remaining space for persistence
+  -p, --persistence=SIZE    the size, in IEC units, of the persistence partition (default 4GiB);
+                              if set to 0, no persistence partition is created
+  -r, --root-size=SIZE      the size, in IEC units, of the root partition (default 1.05 x IMAGE size)
+  -v, --verbose             show details of operations as they are executed
 
- -h, --help                 display this help
-     --version              display version
+  -h, --help                 display this help
+      --version              display version
 
   Note: options are parsed using getopt (1), if options are not being parsed as expected try reading man getopt.
 
-Return Values:
-  0    normal program execution
-  1    device has mounted partitions
- 64    incorrect arguments
- 65    incorrect data provided
+RETURN VALUES:
+   0    normal program execution
+   1    device has mounted partitions
+  64    incorrect arguments
+  65    incorrect data provided
 
-Partition Definition:
-  The partition information read from STDIN is expected one per line, in the following format:
+PARTITION DEFINITION:
+  The partition information read from STDIN or a file is expected one per line, in the following format:
    INDEX NAME TYPE FILESYSTEM_TYPE SIZE [FLAG]...
  
-  The INDEX is in relation to the partition in the partition table. In the device, partitions will be in the order they
-  appear in the list. For example,
-   2 part1 ...
-   1 part2 ...
+  The INDEX is in relation to the partition entry in the partition table. In the device, partitions will be in the order
+  they appear in the list. For example,
+
+    2 part1 ...
+    1 part2 ...
+
   would result in the disk starting with part1 and then part2, but part2 would appear first in the partition table. Note
-  it is 1-based.
+  INDEX is 1-based.
  
-  If NAME contains spaces they must be escaped. It is used for both the partition name and, for ntf or ext* filesystems,
-  the filesystem's label.
+  If NAME contains spaces they must be escaped with a backslash. It is used for both the partition name and, for ntf or
+  ext* filesystems, the filesystem's label.
  
   The TYPE is the partition's GPT partition type GUID.
  
   The valid values of FILESYSTEM_TYPE are none, fat12, fat16, fat32, ntfs, ext2, ext3, and ext4, where none means no
   filesystem will be created in the partition.
  
-  A partition's SIZE must be given in IEC-I format (KiB, MiB, GiB...). The last partition can have its SIZE set to 0, in
-  which case all remaining space is used.
+  A partition's SIZE must be given in IEC format (KiB, MiB, GiB...). The last partition in the list can have its SIZE
+  set to 0, in which case all remaining space is used.
  
   The optional FLAG list is a space separated list of integers, with valid values between 0 and 63. These correspond to
   the GPT attribute flags to be set for the partition.
-"
 
+TESTING:
+  Before running this on a real device, consider creating a file of identical size, mounting it as a loopback device,
+  and running with the desired configuration on that loopback device. To do this, first create the file:
+
+    dd if=/dev/zero of=loopback.img bs=100M count=10
+
+  making sure that bs x count = desired size. Then, mount the file as a loopback device:
+
+    sudo losetup -fP loopback.img
+    losetup -a | grep loopback.img | cut -d':' -f1
+
+  The second command will print the path to the file mounted as a loopback device, which can then be used as the second
+  argument to this program. This allows running this program on the loopback device to test the result matches the
+  desired partition setup, instead of applying untested changes to a real device.
+ 
+  To clean up, unmount the filesystem and remove the file:
+
+    sudo losetup -d /dev/loopX
+    rm loopback.img
+"
+    exit "$EX_OK"
+}
+
+usage () {
+    echo \
+"
+Usage: $0 [OPTION]... IMAGE DEVICE
+
+ For more information, run $0 --help
+"
     exit "$1"
 }
 
@@ -147,8 +181,8 @@ parse_args () {
     #  PERSISTENCE_SIZE
     #  VERBOSE
 
-    local -r options="fi::np:vh"
-    local -r long="force,input:,no-storage,persistence:,verbose,help,version"
+    local -r options="fi::np:r:vh"
+    local -r long="force,input:,no-storage,persistence:,root:,verbose,help,version"
 
     local args
 
@@ -163,7 +197,7 @@ parse_args () {
     while true; do
         case "$1" in
             -h|--help)
-                usage "$EX_OK";;
+                help;;
             
             -f|--force)
                 local -r force=true
@@ -179,16 +213,19 @@ parse_args () {
                 shift 2;;
 
             -n|--no-storage)
-                local -r storage=true
+                local -r storage=false
                 shift;;
 
             -p|--persistent)
-                if ! [[ $2 =~ ^[0-9]+([KMGTPEZY]i)?B$ ]]; then
-                    error "optional argument $1 must be succeeded by a valid IEC unit (B, KiB, MiB, GiB...)"
-                    usage "$EX_USAGE"
-                fi
+                validate_iec "$1" "$2"
 
                 local -r persistence_size=$2
+                shift 2;;
+
+            -r|--root-size)
+                validate_iec "$1" "$2"
+
+                local -r root_size=$2
                 shift 2;;
 
             -v|--verbose)
@@ -207,8 +244,9 @@ parse_args () {
 
     declare -gr INPUT="${input:-}"
     declare -gr FORCE="${force:=false}"
-    declare -gr STORAGE="${storage:=false}"
+    declare -gr STORAGE="${storage:=true}"
     declare -gr PERSISTENCE_SIZE="${persistence_size:=4GiB}"
+    declare -gr ROOT_SIZE="${root_size:-}"
     declare -gr VERBOSE="${verbose:=false}"
 
     # Positional arguments.
@@ -230,6 +268,7 @@ parse_args () {
     info " INPUT=$INPUT"
     info " STORAGE=$storage"
     info " PERSISTENCE_SIZE=$PERSISTENCE_SIZE"
+    info " ROOT_SIZE=$ROOT_SIZE"
     info " VERBOSE=$VERBOSE"
     info " DISK=$DISK"
     info " IMAGE=$IMAGE"
@@ -259,20 +298,37 @@ validate () {
 
         info ""
     fi
+
+    # Check if both --no-storage and --persistence=0B are present.
+    if ! $STORAGE && [ "$PERSISTENCE_SIZE" == "0B" ]; then
+        error "cannot simultaneously have no storage and no persistence partitions (would result in unused space)"
+        usage "$EX_USAGE"
+    fi
 }
 
 default_partitions () {
     # Returns the default configuration of partitions to create in the device.
     # Uses the following global variables:
     #  $PERSISTENCE_SIZE - the size of the casper-rw persistence partition
+    #  $ROOT_SIZE        - the size of the root partition
     #  $STORAGE          - whether to include a storage partition
 
-    # Determine the size of the image, as that dictates the size of root partition.
-    # The root partition will be set to 105% of the image's size to account for ext4 filesystem overhead.
-    local -r img_size=$(( $(stat --printf="%s" "$IMAGE") * 21/20 / MiB))MiB
-
+    if [ -z "${ROOT_SIZE:-}" ]; then
+        # Determine the size of the image, as that dictates the size of root partition.
+        # The root partition will be set to 105% of the image's size to account for ext4 filesystem overhead.
+        local -r img_size=$(( $(stat --printf="%s" "$IMAGE") * 21/20 / MiB))MiB
+    else
+        local -r img_size="$ROOT_SIZE"
+    fi
+    
     info "partition for OS image will have size $img_size"
     info ""
+
+    local -r no_persistence="\
+2 BIOS       $BIOS   none  1MiB
+3 EFI        $EFI    fat32 300MiB
+4 root       $LINUX  ext4  $img_size
+1 USB\ Data  $MSDATA ntfs  0"
 
     local -r no_storage="\
 1 BIOS       $BIOS   none  1MiB
@@ -287,7 +343,9 @@ default_partitions () {
 5 casper-rw  $LINUX  ext4  $PERSISTENCE_SIZE
 1 USB\ Data  $MSDATA ntfs  0"
 
-    if $STORAGE; then
+    if [ "$PERSISTENCE_SIZE" == "0B" ]; then
+        echo "$no_persistence"
+    elif ! $STORAGE; then
         echo "$no_storage"
     else
         echo "$default"
@@ -413,6 +471,9 @@ install_grub () {
     # $1 - the grub partition name
     # $2 - the boot partition name
     # $3 - the index of the root partition in the device
+    #
+    # Uses the following global variables:
+    #  $PERSISTENCE_SIZE - the size of the casper-rw persistence partition
 
     local -r grub="$1" boot="$2"
 
@@ -433,7 +494,9 @@ $(cat /mnt/usb-boot/boot/grub/grub.cfg)"
 
     echo "$grub_config" > /mnt/usb-boot/boot/grub/grub.cfg
 
-    sed -i "/^\tlinux/ { s/$/persistent/; :a; n; ba; }" /mnt/usb-boot/boot/grub/grub.cfg
+    if [ "$PERSISTENCE_SIZE" != "0B" ]; then
+        sed -i "/^\tlinux/ { s/$/persistent/; :a; n; ba; }" /mnt/usb-boot/boot/grub/grub.cfg
+    fi
 
     info "modified grub configuration"
 
@@ -455,6 +518,17 @@ $(cat /mnt/usb-boot/boot/grub/grub.cfg)"
 }
 
 # Utilities
+
+validate_iec () {
+    # Exit with return value $EX_USAGE if second argument is not a valid IEC unit.
+    #  $1 - the option being parsed
+    #  $2 - the option argument to validate
+
+    if ! [[ $2 =~ ^[0-9]+([KMGTPEZY]i)?B$ ]]; then
+        error "option $1 must be succeeded by a valid IEC unit (B, KiB, MiB, GiB...)"
+        usage "$EX_USAGE"
+    fi
+}
 
 get_partition_name () {
     # Get partition at the given index on the given device.
